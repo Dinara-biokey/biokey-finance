@@ -4,6 +4,8 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>biokey. finance</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%23161922'/%3E%3Ctext x='50' y='62' font-family='Arial,sans-serif' font-weight='900' font-size='52' fill='%23e8175d' text-anchor='middle'%3Eb%3C/text%3E%3Crect x='14' y='76' width='20' height='4' rx='2' fill='%23222'/%3E%3Crect x='36' y='76' width='20' height='4' rx='2' fill='%23e8175d'/%3E%3Crect x='58' y='76' width='20' height='4' rx='2' fill='%23f5c400'/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%23161922'/%3E%3Ctext x='50' y='62' font-family='Arial,sans-serif' font-weight='900' font-size='52' fill='%23e8175d' text-anchor='middle'%3Eb%3C/text%3E%3Crect x='14' y='76' width='20' height='4' rx='2' fill='%23222'/%3E%3Crect x='36' y='76' width='20' height='4' rx='2' fill='%23e8175d'/%3E%3Crect x='58' y='76' width='20' height='4' rx='2' fill='%23f5c400'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
@@ -740,6 +742,72 @@ window.toggleReg=()=>{
     ?'Уже есть аккаунт? <span onclick="toggleReg()">Войти</span>'
     :'Нет аккаунта? <span onclick="toggleReg()">Зарегистрироваться</span>';
 };
+// ── ACCESS CONTROL ──
+// Allowed users stored at /config/allowed_users/{uid} = {email, name, ts}
+// New users must enter invite code to get access
+
+async function checkUserAccess(user){
+  try{
+    const snap = await new Promise(res=>{
+      const r = ref(DB, 'config/allowed_users/'+user.uid);
+      onValue(r, s=>{ off(r); res(s); }, {onlyOnce:true});
+    });
+    if(snap.val()){
+      // Already allowed — let through (onAuthStateChanged will handle UI)
+      return;
+    }
+    // New user — need invite code
+    // Sign them out first, show invite prompt
+    await signOut(AU);
+    showGoogleInvitePrompt(user);
+  }catch(e){
+    console.error('checkUserAccess error:', e);
+  }
+}
+
+function showGoogleInvitePrompt(user){
+  // Show invite modal on auth screen
+  document.getElementById('auth-screen').style.display='flex';
+  document.getElementById('app').style.display='none';
+  const el = document.getElementById('auth-err');
+  el.style.color='var(--amber)';
+  el.textContent='👋 Добро пожаловать, '+( user.displayName||user.email)+'! Введите инвайт-код для доступа.';
+  // Pre-fill email, show invite field
+  document.getElementById('auth-email').value = user.email||'';
+  document.getElementById('auth-name').value  = user.displayName||'';
+  // Store pending google user
+  window._pendingGoogleUser = user;
+  // Switch to reg mode to show invite field
+  if(!isReg) window.toggleReg();
+  // Change button to "Подтвердить код"
+  document.querySelector('.btn-auth').textContent='Подтвердить код';
+  document.querySelector('.btn-auth').onclick = ()=> confirmGoogleInvite();
+}
+
+async function confirmGoogleInvite(){
+  const inv     = (document.getElementById('auth-invite')?.value||'').trim().toUpperCase();
+  const el      = document.getElementById('auth-err');
+  const user    = window._pendingGoogleUser;
+  if(!user){ el.textContent='Ошибка — попробуйте снова'; return; }
+  if(!inv){ el.textContent='⚠ Введите инвайт-код'; return; }
+  const correct = await getInviteCode();
+  if(inv !== correct){ el.textContent='❌ Неверный инвайт-код'; return; }
+  // Add to allowed users
+  try{
+    await set(ref(DB,'config/allowed_users/'+user.uid), {
+      email: user.email||'', name: user.displayName||'', ts: Date.now()
+    });
+    // Now sign in with Google again
+    el.textContent='';
+    document.querySelector('.btn-auth').textContent='Зарегистрироваться';
+    document.querySelector('.btn-auth').onclick = ()=> window.doAuth();
+    if(isReg) window.toggleReg();
+    window._pendingGoogleUser = null;
+    // Re-sign in
+    await signInWithPopup(AU, GP);
+  }catch(e){ el.textContent='Ошибка: '+e.message; }
+}
+
 // ── INVITE CODE ──
 // Код хранится в Firebase: /config/invite_code
 // Чтобы поменять: Firebase Console → Realtime Database → config → invite_code → Edit
@@ -789,8 +857,11 @@ window.doAuth=async()=>{
   }
 };
 window.doGoogle=async()=>{
-  try{ await signInWithPopup(AU,GP); }
-  catch(e){
+  try{
+    const result = await signInWithPopup(AU,GP);
+    // Check if this Google user is allowed
+    await checkUserAccess(result.user);
+  }catch(e){
     console.error('Google auth error:', e.code, e.message);
     const m={
       'auth/popup-blocked':'Браузер заблокировал popup — разрешите в настройках',
@@ -804,8 +875,25 @@ window.doGoogle=async()=>{
 };
 window.doLogout=async()=>{ unsubAll(); await signOut(AU); };
 
-onAuthStateChanged(AU,user=>{
+onAuthStateChanged(AU,async user=>{
   if(user){
+    // Check access for email/password users (Google users checked in doGoogle)
+    const provider = user.providerData[0]?.providerId;
+    if(provider === 'password'){
+      // Email users who registered correctly are auto-allowed
+      // Just add them to allowed list if not there
+      try{
+        const snap = await new Promise(res=>{
+          const r = ref(DB,'config/allowed_users/'+user.uid);
+          onValue(r,s=>{off(r);res(s);},{onlyOnce:true});
+        });
+        if(!snap.val()){
+          await set(ref(DB,'config/allowed_users/'+user.uid),{
+            email:user.email||'', name:user.displayName||'', ts:Date.now()
+          });
+        }
+      }catch(e){}
+    }
     document.getElementById('auth-screen').style.display='none';
     document.getElementById('app').style.display='block';
     document.getElementById('user-name').textContent=me();
